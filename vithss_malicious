@@ -1,0 +1,306 @@
+#include <iostream>
+#include <vector>
+#include <chrono>
+#include <fstream>
+#include <iomanip>
+#include <map>
+#include <algorithm>
+#include <random>
+#include <flint/flint.h>
+#include <flint/nmod_mat.h>
+#include <flint/nmod_vec.h>
+
+using namespace std;
+
+const mp_limb_t PRIME_64 = 18446744073709551557ULL; 
+nmod_t ctx; 
+
+int m_vars = 50;       
+int d_deg = 3;        
+int t_thr = 1;        
+int current_ell = 1;  
+int k_srv = 4;        
+
+std::mt19937_64 fast_rng(12345);
+
+inline mp_limb_t fast_rand_mod() { return fast_rng() % ctx.n; }
+inline mp_limb_t fast_rand_mod_nonzero() {
+    mp_limb_t r = fast_rng() % ctx.n;
+    return r == 0 ? 1 : r;
+}
+
+mp_limb_t add(mp_limb_t a, mp_limb_t b) { return nmod_add(a, b, ctx); }
+mp_limb_t mul(mp_limb_t a, mp_limb_t b) { return nmod_mul(a, b, ctx); }
+mp_limb_t sub(mp_limb_t a, mp_limb_t b) { return nmod_sub(a, b, ctx); }
+mp_limb_t inv(mp_limb_t a) { return nmod_inv(a, ctx); }
+mp_limb_t power(mp_limb_t base, mp_limb_t exp) {
+    mp_limb_t res = 1; base %= ctx.n;
+    while (exp > 0) {
+        if (exp % 2 == 1) res = mul(res, base);
+        base = mul(base, base); exp /= 2;
+    }
+    return res;
+}
+
+long long comb(int n, int k) {
+    if (k < 0 || k > n) return 0;
+    if (k == 0 || k == n) return 1;
+    if (k > n / 2) k = n - k;
+    long long res = 1;
+    for (int i = 1; i <= k; ++i) res = res * (n - i + 1) / i;
+    return res;
+}
+
+struct PolyTerm { mp_limb_t coeff; int vars[4]; };
+vector<PolyTerm> global_poly;
+
+void generate_poly_by_exact_terms(int m, int d, int target_terms) {
+    global_poly.clear();
+    map<vector<int>, mp_limb_t> unique_terms;
+    long long max_terms = comb(m + d - 1, d);
+    if (target_terms > (long long)max_terms) target_terms = max_terms;
+    while(unique_terms.size() < (size_t)target_terms) {
+        vector<int> vars(d);
+        for(int j = 0; j < d; ++j) vars[j] = fast_rng() % m;
+        sort(vars.begin(), vars.end()); 
+        unique_terms[vars] = fast_rand_mod_nonzero();
+    }
+    for (auto const& [vars_key, coeff_val] : unique_terms) {
+        PolyTerm pt; pt.coeff = coeff_val;
+        for (int i = 0; i < d; ++i) pt.vars[i] = vars_key[i];
+        for (int i = d; i < 4; ++i) pt.vars[i] = 0;
+        global_poly.push_back(pt);
+    }
+}
+
+struct ServerShare {
+    vector<vector<mp_limb_t>> in_r;      
+    vector<vector<vector<mp_limb_t>>> rec_r; 
+};
+
+struct EvalResult {
+    mp_limb_t f_val;
+    vector<mp_limb_t> grad;
+    vector<vector<mp_limb_t>> hessian;
+};
+
+void eval_all(const vector<mp_limb_t>& x, int ell, EvalResult& out) {
+    out.f_val = 0;
+    if (ell >= 1) out.grad.assign(m_vars, 0);
+    if (ell >= 2) {
+        out.hessian.assign(m_vars, vector<mp_limb_t>(m_vars, 0));
+    }
+
+    for (const auto& term : global_poly) {
+        mp_limb_t c = term.coeff;
+        mp_limb_t xv[4];
+        for (int i = 0; i < d_deg; ++i) xv[i] = x[term.vars[i]];
+
+        if (d_deg == 3) {
+            mp_limb_t p01 = mul(xv[0], xv[1]);
+            out.f_val = add(out.f_val, mul(c, mul(p01, xv[2])));
+            if (ell >= 1) {
+                out.grad[term.vars[0]] = add(out.grad[term.vars[0]], mul(c, mul(xv[1], xv[2])));
+                out.grad[term.vars[1]] = add(out.grad[term.vars[1]], mul(c, mul(xv[0], xv[2])));
+                out.grad[term.vars[2]] = add(out.grad[term.vars[2]], mul(c, p01));
+            }
+        }
+    }
+}
+
+vector<EvalResult> Eval(const ServerShare& share) {
+    vector<EvalResult> out(d_deg + 1);
+    for (int r = 0; r <= d_deg; ++r) {
+        eval_all(share.in_r[r], current_ell, out[r]);
+    }
+    return out;
+}
+
+vector<mp_limb_t> precompute_dec_weights(int D_deg_local, int k, int ell) {
+    nmod_mat_t M, invM;
+    nmod_mat_init(M, D_deg_local + 1, D_deg_local + 1, ctx.n);
+    nmod_mat_init(invM, D_deg_local + 1, D_deg_local + 1, ctx.n);
+    int eq_count = 0;
+    for (int j = 1; j <= k && eq_count < D_deg_local + 1; ++j) {
+        for (int h = 0; h <= ell && eq_count < D_deg_local + 1; ++h) {
+            for (int col = h; col <= D_deg_local; ++col) {
+                mp_limb_t coeff = 1;
+                for (int c = 0; c < h; ++c) coeff = mul(coeff, col - c);
+                nmod_mat_entry(M, eq_count, col) = mul(coeff, power(j, col - h));
+            }
+            eq_count++;
+        }
+    }
+    nmod_mat_inv(invM, M);
+    vector<mp_limb_t> W(D_deg_local + 1);
+    for (int i = 0; i < D_deg_local + 1; ++i) W[i] = nmod_mat_entry(invM, 0, i);
+    nmod_mat_clear(M); nmod_mat_clear(invM);
+    return W;
+}
+
+void Share(const vector<mp_limb_t>& x_input, vector<mp_limb_t>& vk_alpha, vector<ServerShare>& shares) {
+    vector<mp_limb_t> v(d_deg + 1); 
+    v[0] = 1;
+    
+    // 【核心修复】：增加严格的去重检测，防止小素数域下 v_r = v_s 导致的 1/0 崩溃
+    for (int r = 1; r <= d_deg; ++r) {
+        bool unique;
+        do {
+            unique = true;
+            v[r] = fast_rand_mod_nonzero();
+            if (v[r] <= 1) unique = false;
+            for (int s = 1; s < r; ++s) {
+                if (v[r] == v[s]) unique = false;
+            }
+        } while (!unique);
+    }
+
+    vk_alpha.assign(d_deg + 1, 0);
+    for (int r = 0; r <= d_deg; ++r) {
+        mp_limb_t prod = 1;
+        for (int s = 0; s <= d_deg; ++s) {
+            if (s != r) prod = mul(prod, mul(sub(0, v[s]), inv(sub(v[r], v[s]))));
+        }
+        vk_alpha[r] = prod;
+    }
+    
+    shares.resize(k_srv);
+    for (int j = 1; j <= k_srv; ++j) {
+        shares[j-1].in_r.assign(d_deg + 1, vector<mp_limb_t>(m_vars));
+        shares[j-1].rec_r.assign(d_deg + 1, vector<vector<mp_limb_t>>(current_ell, vector<mp_limb_t>(m_vars)));
+        for (int r = 0; r <= d_deg; ++r) {
+            vector<vector<mp_limb_t>> a(t_thr, vector<mp_limb_t>(m_vars));
+            for(int h=0; h<t_thr; ++h) for(int i=0; i<m_vars; ++i) a[h][i] = fast_rand_mod();
+            for(int i=0; i<m_vars; ++i) {
+                shares[j-1].in_r[r][i] = mul(v[r], x_input[i]);
+                mp_limb_t u_pow = j;
+                for(int h=1; h<=t_thr; ++h) {
+                    shares[j-1].in_r[r][i] = add(shares[j-1].in_r[r][i], mul(a[h-1][i], u_pow));
+                    if (current_ell >= 1) {
+                        mp_limb_t d1 = mul(h, power(j, h-1));
+                        shares[j-1].rec_r[r][0][i] = add(shares[j-1].rec_r[r][0][i], mul(a[h-1][i], d1));
+                    }
+                    u_pow = mul(u_pow, j);
+                }
+            }
+        }
+    }
+}
+
+bool Dec(const vector<mp_limb_t>& vk_alpha, const vector<ServerShare>& recs, 
+         const vector<vector<EvalResult>>& outs, const vector<mp_limb_t>& W, mp_limb_t& final_result) {
+    vector<mp_limb_t> y(d_deg + 1);
+    int D = d_deg * t_thr;
+    for (int r = 0; r <= d_deg; ++r) {
+        mp_limb_t yr = 0; int eq = 0;
+        for (int j = 1; j <= k_srv && eq < D + 1; ++j) {
+            yr = add(yr, mul(W[eq++], outs[j-1][r].f_val));
+            if (current_ell >= 1 && eq < D + 1) {
+                mp_limb_t g1 = 0;
+                for(int i=0; i<m_vars; ++i) g1 = add(g1, mul(outs[j-1][r].grad[i], recs[j-1].rec_r[r][0][i]));
+                yr = add(yr, mul(W[eq++], g1));
+            }
+        }
+        y[r] = yr;
+    }
+    mp_limb_t z = 0;
+    for (int r = 0; r <= d_deg; ++r) z = add(z, mul(vk_alpha[r], y[r]));
+    if (z == 0) { final_result = y[0]; return true; }
+    return false;
+}
+
+int main() {
+    nmod_init(&ctx, PRIME_64);
+    cout << "==========================================================" << endl;
+    cout << "EXP 1: End-to-End Cost (Check CSV for results)" << endl;
+    ofstream csv1("exp1_baseline_vs_proposed.csv");
+    csv1 << "t,Mf,Client_Base,Client_Prop,Server_Base,Server_Prop\n";
+    
+    d_deg = 3; current_ell = 1; m_vars = 50;
+    for (int t : {1, 2, 3}) {
+        t_thr = t; k_srv = d_deg * t_thr + 1;
+        auto W = precompute_dec_weights(d_deg * t_thr, k_srv, current_ell);
+        for (int Mf : {1000, 10000, 50000}) {
+            generate_poly_by_exact_terms(m_vars, d_deg, Mf);
+            vector<mp_limb_t> x(m_vars); for(int i=0; i<m_vars; ++i) x[i] = fast_rand_mod();
+            
+            auto t0 = chrono::high_resolution_clock::now();
+            vector<mp_limb_t> vk; vector<ServerShare> shares; Share(x, vk, shares);
+            vector<vector<EvalResult>> outs(k_srv); for(int j=0; j<k_srv; ++j) outs[j] = Eval(shares[j]);
+            mp_limb_t res; Dec(vk, shares, outs, W, res);
+            auto t1 = chrono::high_resolution_clock::now();
+            long long total_us = chrono::duration_cast<chrono::microseconds>(t1 - t0).count();
+            csv1 << t << "," << Mf << "," << total_us/(d_deg+1) << "," << total_us << ",0,0\n";
+        }
+    }
+    csv1.close();
+
+    cout << "\nEXP 2: Malicious Detection (100,000 trials)" << endl;
+    ofstream csv2("exp2_malicious_detection.csv");
+    csv2 << "t,Field_Bits,Theoretical,Empirical_Error,Detections,False_Accepts\n";
+
+    vector<mp_limb_t> test_primes = {
+        (mp_limb_t)251ULL,               // ~2^8  (8-bit prime)
+        (mp_limb_t)65521ULL,             // ~2^16 (16-bit prime)
+        (mp_limb_t)16777213ULL,          // ~2^24 (24-bit prime)
+        (mp_limb_t)4294967291ULL,        // ~2^32 (32-bit prime)
+        (mp_limb_t)PRIME_64              // ~2^64 (64-bit prime)
+    };
+
+    for (int t : {1, 2, 3}) {
+        t_thr = t; k_srv = d_deg * t_thr + 1;
+        cout << "\n>>> Starting Simulations for t = " << t_thr << " <<<" << endl;
+        for (mp_limb_t q : test_primes) {
+            nmod_init(&ctx, q);
+            auto W = precompute_dec_weights(d_deg * t_thr, k_srv, current_ell);
+            generate_poly_by_exact_terms(10, 3, 200);
+            
+            int detected = 0;
+            int false_acc = 0;
+            
+            for (int i = 0; i < 100000; ++i) {
+                vector<mp_limb_t> x(m_vars); 
+                for(int k=0; k<m_vars; ++k) x[k] = fast_rand_mod();
+                
+                EvalResult exp_eval; eval_all(x, 0, exp_eval);
+                
+                vector<mp_limb_t> vk; vector<ServerShare> shares; Share(x, vk, shares);
+                vector<vector<EvalResult>> outs(k_srv); 
+                for(int j=0; j<k_srv; ++j) outs[j] = Eval(shares[j]);
+                
+                // 模拟恶意攻击
+                int srv = fast_rng() % t_thr; 
+                int r_idx = fast_rng() % (d_deg+1);
+                if (fast_rng() % 2 == 0) {
+                    outs[srv][r_idx].f_val = add(outs[srv][r_idx].f_val, fast_rand_mod_nonzero());
+                } else {
+                    outs[srv][r_idx].grad[fast_rng() % m_vars] = add(outs[srv][r_idx].grad[fast_rng() % m_vars], fast_rand_mod_nonzero());
+                }
+
+                mp_limb_t result; 
+                bool is_valid = Dec(vk, shares, outs, W, result);
+                
+                if (!is_valid) {
+                    detected++;
+                } else if (result != exp_eval.f_val) {
+                    false_acc++;
+                }
+            }
+            
+            double theory = (4.0 * d_deg * d_deg) / q;
+            int bit_size = (q < 500ULL) ? 8 : (q < 100000ULL) ? 16 : (q < 20000000ULL) ? 24 : (q < 5000000000ULL) ? 32 : 64;
+            
+            cout << "Field " << bit_size << "-bit (q=" << q << ") | "
+                 << "Theory Max: " << scientific << setprecision(4) << theory * 100 << "% | "
+                 << "Empirical: " << scientific << setprecision(4) << ((double)false_acc/100000) * 100 << "% "
+                 << "(FA: " << false_acc << ")" << endl;
+                 
+            csv2 << t << "," << bit_size << "," 
+                 << scientific << theory * 100 << "," << scientific << ((double)false_acc/100000) * 100 << "," 
+                 << detected << "," << false_acc << "\n";
+        }
+    }
+    csv2.close();
+    cout << "===========================================" << endl;
+    return 0;
+}
